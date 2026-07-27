@@ -1,0 +1,32 @@
+# Dev/runtime image for mincontainer.
+# Runs on Linux (via Docker Desktop's VM) so the container syscalls actually work.
+FROM rust:1-bookworm
+
+# Tools the runtime shells out to (networking) + runc for honest comparison.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 \
+        iptables \
+        runc \
+        curl \
+        ca-certificates \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-extract an Alpine minirootfs to run inside our containers.
+# Arch is detected so this works on both arm64 (Apple Silicon) and amd64.
+ARG ALPINE_VER=3.20.3
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+        aarch64) alpine_arch=aarch64 ;; \
+        x86_64)  alpine_arch=x86_64 ;; \
+        *) echo "unsupported arch $arch" && exit 1 ;; \
+    esac; \
+    mkdir -p /rootfs; \
+    curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/${alpine_arch}/alpine-minirootfs-${ALPINE_VER}-${alpine_arch}.tar.gz" \
+        | tar -xz -C /rootfs; \
+    echo "nameserver 1.1.1.1" > /rootfs/etc/resolv.conf
+
+# Cargo target dir lives outside the mounted source tree for speed + arch isolation.
+ENV CARGO_TARGET_DIR=/target
+WORKDIR /work
