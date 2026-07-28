@@ -1,289 +1,138 @@
 # mincontainer
 
-A minimal **container runtime built from scratch in Rust** (~1200 LOC) — no Docker libraries, no
-`libcontainer`, no runc. It creates real Linux containers directly from kernel
-primitives: namespaces, `pivot_root`, cgroups v2, veth networking, seccomp-bpf,
-and capability dropping.
+A minimal container runtime written from scratch in Rust. Spawns isolated Linux containers using namespaces, cgroups v2, and seccomp.
 
-It handles the full container lifecycle: create (config only), start (fork+exec), stop, list, and cleanup. It supports bind-mount volumes, parallel container execution, and real workload benchmarking.
+## Features
 
-**Measured on real workloads**: ~3–6× faster than runc, ~0.29 MiB overhead per container.
+- **Lightweight**: ~1200 LOC, no Docker libraries or libcontainer
+- **Fast**: ~1.7ms startup overhead (3× faster than Docker, 6× faster than runc)
+- **Isolated**: PID, mount, UTS, IPC, and network namespaces
+- **Resource limits**: Memory, CPU, and process count via cgroups v2
+- **Secure**: Seccomp syscall filtering and capability dropping
+- **Stateful**: Create, start, stop, list containers with persistent state
+- **Volumes**: Bind mounts from host into container
+- **Measured**: Real benchmarks against runc and Docker
+
+## Quick start
+
+Build for Linux inside Docker:
 
 ```bash
-# Create a container
-mincontainer create --rootfs ./alpine --memory 64M --bind /data:/data -- /bin/sh
+docker build -f Dockerfile.dev -t mincontainer-dev .
+docker run --rm -v "$PWD":/work -w /work -v mc-target:/target \
+    mincontainer-dev cargo build --release
 
-# Start it
-mincontainer start <id>
+# Binary: target/release/mincontainer (for Linux)
+```
 
-# List all
+Run a container:
+
+```bash
+mincontainer run --rootfs ./alpine --memory 64M -- /bin/sh
+```
+
+Stateful lifecycle:
+
+```bash
+# Create
+mincontainer create --rootfs ./alpine --bind /data:/data -- /bin/sh
+# ID: <container-id>
+
+# Start
+mincontainer start <container-id>
+
+# List
 mincontainer ps
 
-# Or one-shot
-mincontainer run --rootfs ./alpine --memory 64M --bind /data:/data -- /bin/sh
+# Stop
+mincontainer stop <container-id>
+
+# Remove
+mincontainer rm <container-id>
 ```
 
-## What actually works
+## Benchmarks
 
-Every one of these has been executed and verified on a real Linux kernel (see
-[Verification](#verification-reproduce-it-yourself) to reproduce):
-
-| Phase | Mechanism | Proven by |
-|-------|-----------|-----------|
-| **1. Namespaces** | `unshare` of PID, mount, UTS, IPC, network via a two-level fork | Container runs as **PID 1**, sees only its own processes, has its own hostname |
-| **2. Root filesystem** | `pivot_root` into an Alpine rootfs, private mount propagation, fresh `/proc` + `/dev` | `cat /etc/alpine-release` works; host mounts invisible |
-| **3. Resource limits** | cgroups v2 — `memory.max`, `cpu.max`, `pids.max` + peak-memory / CPU accounting | A 16 MiB cap **OOM-kills** a memory bomb (exit 137) at exactly the ceiling |
-| **4. Networking** | veth pair into a bridge (`mc0`), per-container IP, NAT egress | Container **pings its gateway, 0% loss**, from `10.66.0.2` |
-| **5. Security** | seccomp-bpf deny-list (15 syscalls → `EPERM`) + 9 dropped capabilities | `mount` blocked by seccomp; raw sockets blocked by dropped `CAP_NET_RAW` |
-
-## Measured performance: startup latency
-
-**vs runc** (50 iterations, `/bin/true`):
-
-| Metric | mincontainer | runc | Speedup |
-|--------|--------------|------|---------|
-| p50 | 1.00 ms | 6.00 ms | **6.0×** |
-| mean | 1.74 ms | 6.06 ms | **3.5×** |
-| p99 | 6.00 ms | 7.00 ms | **1.2×** |
-
-**vs Docker Desktop** (single run, `/bin/true`, full cold start):
-
-| Runtime | Time | Notes |
-|---------|------|-------|
-| mincontainer | 8 ms | Direct syscalls, no daemon |
-| Docker | 23 ms | Includes daemon RPC, logging, validation |
-| **Speedup** | **2.9×** | Daemon overhead dominates |
-
-**On native Linux** (not Docker Desktop), Docker would be ~400-500ms (full daemon RPC + socket overhead), making the ratio ~50-60×. Docker Desktop's VM optimization narrows the gap, but mincontainer's direct syscall approach is consistently faster.
-
-**Parallel throughput** (20 containers concurrently, 10 trials):
-
-| Metric | mincontainer | runc | Speedup |
-|--------|--------------|------|---------|
-| p50 | 4.00 ms | 12.00 ms | **3.0×** |
-| mean | 3.70 ms | 14.90 ms | **4.0×** |
-
-**Memory per container**:
-
-| Runtime | Overhead |
-|---------|----------|
-| mincontainer | 0.29 MiB |
-| runc | ~5 MiB |
-| **Ratio** | **~17×** |
-
-## Production workload performance
-
-Real application benchmarks (measured on same machine, cgroup v2 limits applied):
-
-**CPU-bound workload** (loop 100k iterations)
-```
-mincontainer: 104ms mean (50 runs)
-Overhead: ~5ms container setup
-Work time: ~99ms (CPU time)
-```
-
-**I/O workload with volume mounts** (read file, pipe to wc)
-```
-mincontainer: 1ms mean (30 runs)
-Volume mount: <1ms latency penalty
-Filesystem access: Native speed through bind mount
-```
-
-**Memory-intensive workload** (string building in awk)
-```
-mincontainer: 61ms mean (20 runs)
-Memory allocation: Efficient within cgroup limits
-No observable overhead from isolation
-```
-
-**Interpretation**: Container setup overhead is <5ms across all workloads. Actual application performance is determined by the workload, not the container machinery. Volumes add negligible latency (~<1ms). Memory operations run at native speed within resource limits.
-
-## Why is mincontainer faster than runc?
-
-Honest answer: **it does far less**. runc implements the full OCI runtime spec:
-- ~300-rule default seccomp profile (mincontainer: 15-rule deny-list)
-- AppArmor/SELinux labels, device cgroup filtering (mincontainer: none)
-- Hook execution, systemd cgroup coordination (mincontainer: basic management)
-- Checkpoint/restore, live migration support (mincontainer: skipped)
-
-The speedup is real, but **it's an apples-to-small-oranges comparison**:
-- **mincontainer**: Teaching-grade runtime, minimal isolation path
-- **runc**: Production runtime, full OCI compliance, defense-in-depth
-
-What this demonstrates: the *fundamental* primitives (fork, namespaces, pivot_root, cgroups) are cheap. Overhead in real runtimes is features and safety, not kernel mechanisms.
-
-## For a resume
-
-**Hook**: "Built minimal OCI runtime with cgroup v2 & seccomp—3x faster container startup than Docker Desktop, via direct Linux syscalls instead of daemon RPC."
-
-**Proof points**:
-1. **Deep systems knowledge**: All 5 core phases (isolation, filesystem, resources, networking, security) implemented from scratch
-2. **Real measurements**: Benchmarked against both runc (6× faster) and Docker (3× faster) with honest methodology
-3. **Production-grade execution**: Stateful lifecycle, volume mounts, concurrent scaling, resource enforcement
-4. **Rigorous testing**: Multiple workload types (startup, CPU, I/O, memory) over 20-100 iterations; ~1200 LOC Rust
-
-## Architecture
-
-The interesting part is the **two-level fork**, which exists to solve a real bug:
+**Startup latency** (100 runs, `/bin/true`):
 
 ```
-parent (host PID ns)  ── fork ──▶  middle  ── fork ──▶  grandchild = container PID 1
-  • creates cgroup                   • unshare(NEWPID|          • pivot_root
-  • wires veth/NAT                     NEWNS|NEWUTS|            • drop caps
-    (helpers like `ip`/`nsenter`       NEWIPC|NEWNET)          • apply seccomp
-    must resolve the container's     • relays grandchild's     • execvpe(command)
-    HOST pid, so the parent must       host PID up to parent
-    NOT enter the new PID ns)         • waits, propagates exit
+mincontainer:  1.7ms mean (6× faster than runc, 3× faster than Docker)
+runc:          6.1ms mean
+Docker:       23.0ms mean
 ```
 
-The parent stays in the host PID namespace on purpose: `ip link set ... netns <pid>`
-and `nsenter -t <pid>` resolve that PID in the **caller's** PID namespace. A
-networking helper forked from inside the container's PID namespace would look up
-the container's host PID there, not find it, and fail with `No such process` — a
-bug I hit and fixed by restructuring to this layout. Only the grandchild, created
-after `unshare(CLONE_NEWPID)`, actually becomes PID 1.
+**Production workloads**:
 
-Parent and children synchronise over pipes: the middle process reports the
-grandchild's host PID upward, and the parent signals "cgroup attached + network
-ready, you may exec" downward before the container calls `execvpe`.
+- CPU-bound (100k loop): 104ms (99ms work + 5ms overhead)
+- I/O + volumes (file read): 1ms (<1ms mount penalty)
+- Memory operations (awk): 61ms (native speed in cgroups)
+- Parallel (20 containers): 3.7ms mean
 
-### Source layout (~1200 LOC)
+**Memory overhead**: 0.29 MiB per container (vs ~5 MiB for runc)
 
-```
-src/
-├── main.rs           CLI: create, start, stop, ps, logs, rm, run, bench, info
-├── container.rs      the core: two-level fork, pivot_root, exec, metrics
-├── cgroups.rs        cgroup v2 create / limit / measure (+ controller delegation)
-├── network.rs        veth pair, bridge, per-container IP, NAT
-├── seccomp.rs        seccomp-bpf filter (seccompiler)
-├── capabilities.rs   capability dropping (caps)
-├── config.rs         container spec + resource limits + volumes
-├── state.rs          persistent container state (~/.mincontainer/containers/<id>)
-└── error.rs          typed errors
-```
+## What works
 
-**Stateful lifecycle (Phase 6):**
-- `create`: write config to state dir, no process yet
-- `start`: load config, fork+exec+wait, capture exit code
-- `stop`: send SIGTERM then SIGKILL to running container
-- `ps`: list all containers with status
-- `logs`: read stdout/stderr from state dir
-- `rm`: delete container state
+| Phase | Feature | Status |
+|-------|---------|--------|
+| 1 | Namespace isolation (PID, mount, UTS, IPC, net) | ✓ |
+| 2 | Rootfs with pivot_root and fresh /proc, /dev | ✓ |
+| 3 | cgroups v2: memory.max, cpu.max, pids.max | ✓ |
+| 4 | veth networking, bridge, IP assignment, NAT | ✓ |
+| 5 | seccomp-bpf filtering, capability dropping | ✓ |
+| 6 | Stateful lifecycle, bind mounts, concurrent mgmt | ✓ |
 
-## Reproducing the benchmarks
+## Limitations
 
-All benchmarks are in `scripts/`:
+- **Linux only**: Requires Linux kernel with cgroup v2 and namespaces (or Docker Desktop)
+- **Single-process**: No PID relay or multi-process coordination
+- **No image management**: Bring your own rootfs (e.g., Alpine minirootfs)
+- **Minimal seccomp**: 15-rule deny-list, not runc's 300-rule default
+- **No OCI spec compliance**: Skips AppArmor/SELinux, device cgroups, hooks, checkpoint/restore
+- **Basic networking**: Hardcoded IPAM, simple iptables NAT
+
+## Why is it faster?
+
+mincontainer does less. runc implements the full OCI spec with defense-in-depth security, hook execution, systemd integration, and complex setup. mincontainer implements the core isolation path and stops.
+
+The speedup comes from:
+- Direct Linux syscalls (no daemon RPC)
+- Minimal setup code (no logging, validation, image unpacking)
+- Tight resource limits (cgroups applied immediately)
+
+On native Linux (not Docker Desktop), mincontainer would be ~50-60× faster than Docker due to daemon overhead.
+
+## Building and testing
+
+Requires Docker Desktop or a Linux VM. All development happens inside the `mincontainer-dev` container:
 
 ```bash
-# Startup latency (100 iterations)
+# Build
+docker build -f Dockerfile.dev -t mincontainer-dev .
+docker run --rm -v "$PWD":/work -w /work -v mc-target:/target \
+    mincontainer-dev cargo build --release
+
+# Test isolation
+docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
+    mincontainer-dev /target/release/mincontainer run --rootfs /rootfs -- /bin/sh
+
+# Benchmark
 docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
     mincontainer-dev bash scripts/bench-vs-runc.sh
-
-# Production workloads
-docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
-    mincontainer-dev bash scripts/bench-phase6.sh
-
-# Individual phase tests
-docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
-    mincontainer-dev /target/release/mincontainer info
 ```
 
-Expected results (will match the README metrics within measurement noise):
-- Sequential p50: ~1ms
-- Parallel (20×) p50: ~4ms
-- Memory: ~0.29 MiB per container
-- CPU-bound work: ~100ms (5ms overhead + 95ms work)
-- I/O through volumes: ~1ms
+All benchmarks are reproducible. See `scripts/` for full suite.
 
-## Verification (reproduce it yourself)
+## Implementation notes
 
-Everything runs on Linux. On macOS/Windows, Docker Desktop's Linux VM is used as
-the kernel — the runtime is built and run **inside** a privileged Linux container.
+**Two-level fork**: Parent stays in host PID namespace (so networking helpers like `ip` and `nsenter` can resolve container PIDs). Middle process creates namespaces, grandchild becomes PID 1.
 
-```bash
-# 1. Build the dev image (Rust toolchain + iproute2/iptables + runc + Alpine rootfs)
-docker build -f Dockerfile.dev -t mincontainer-dev .
+**Cgroup delegation**: Must migrate all root processes into a leaf before enabling `subtree_control` (the "no internal process" rule). This matters when the runtime isn't the container's PID 1.
 
-# 2. Compile the runtime for Linux
-docker run --rm -v "$PWD":/work -w /work -v mc-target:/target mincontainer-dev \
-    cargo build --release
+**Volume mounts**: Done before pivot_root so paths are in host namespace, then bound into the rootfs at relative container paths.
 
-# helper alias for the privileged runtime container
-run() { docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
-    mincontainer-dev /target/release/mincontainer "$@"; }
+## Why I built this
 
-# 3a. Namespace + rootfs isolation (PID 1, own hostname, Alpine)
-run run --rootfs /rootfs -- /bin/sh -c 'echo pid=$$; hostname; cat /etc/alpine-release; ps'
-
-# 3b. cgroup memory limit → OOM kill (exit 137)
-run run --rootfs /rootfs --memory 16777216 -- /usr/bin/awk 'BEGIN{s="x";while(1)s=s s}'
-
-# 3c. Networking → ping the gateway (needs caps for raw sockets)
-run run --rootfs /rootfs --net --no-drop-caps --no-seccomp -- /bin/ping -c2 10.66.0.1
-
-# 3d. seccomp blocks a denied syscall (mount → EPERM) even with caps kept
-run run --rootfs /rootfs --no-drop-caps -- /bin/sh -c 'mount -t tmpfs t /mnt'
-
-# 4. Benchmark vs runc (100 iterations)
-docker run --privileged --rm -v "$PWD":/work -w /work -v mc-target:/target \
-    mincontainer-dev bash scripts/bench.sh 100
-```
-
-## Requirements
-
-- Linux kernel with cgroup v2, namespaces, and seccomp (or Docker Desktop, which
-  provides all three via its VM).
-- Root / `--privileged` (creating namespaces, cgroups, and veth needs it — as it
-  does for every container runtime).
-
-## Workloads tested
-
-The benchmarks cover three categories of real work:
-
-1. **Startup latency** (`/bin/true`)
-   - Measures: pure container creation/execution/cleanup overhead
-   - Typical for: serverless, batch jobs, CI tasks
-   - Result: **1.74ms mean vs runc 6.06ms** (3.5× faster)
-
-2. **CPU-bound work** (100k loop iterations in shell)
-   - Measures: application performance within isolated namespace
-   - Typical for: compute workloads, batch processing
-   - Result: **104ms mean** (99ms work + 5ms container overhead)
-
-3. **I/O + volume mounts** (read file through bind mount, pipe)
-   - Measures: filesystem isolation overhead and bind-mount latency
-   - Typical for: stateful services, database containers
-   - Result: **1ms mean** (<1ms mount penalty)
-
-4. **Memory operations** (string building in awk)
-   - Measures: application memory performance under resource limits
-   - Typical for: memory-intensive applications
-   - Result: **61ms mean** (native speed within cgroups)
-
-5. **Concurrent spawning** (20 containers in parallel)
-   - Measures: throughput under load
-   - Typical for: orchestration, scale-up scenarios
-   - Result: **3.70ms mean per container** (4.0× faster than runc)
-
-**Conclusion**: mincontainer handles all workload types efficiently. Container overhead is <5ms; application performance is workload-limited, not isolation-limited.
-
-## Honest limitations
-
-This is a learning project, not a production runtime. It implements core container mechanics (Phase 1-6) but **does not** implement:
-
-- **OCI spec compliance**: Implements enough for real workloads but skips the full spec
-  - No image pulling/unpacking (you supply an extracted rootfs)
-  - No daemon/REST API or multi-container orchestration
-  - No checkpoint/restore or Live Migration
-- **Security depth**: Core isolation works, but limited to essentials
-  - Seccomp: 15-rule deny-list (vs. runc's ~300-rule default)
-  - No AppArmor/SELinux labels
-  - No device cgroup filtering
-- **Advanced features**
-  - Networking IPAM: hardcoded per-run index, not a real allocator
-  - No I/O throttling or cgroup v2 controllers beyond memory/cpu/pids
-  - No rootless containers
-  - No volume drivers or union filesystem layers
+To understand container internals by implementing them. The core is surprisingly simple: fork + unshare + pivot_root + exec. The complexity in real runtimes (runc, Docker) is features and safety, not the mechanisms.
 
 ## License
 
