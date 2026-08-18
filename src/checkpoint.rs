@@ -408,8 +408,26 @@ fn format_addr(raw: &str, v6: bool) -> String {
 // Metadata collection
 // ---------------------------------------------------------------------------
 
+/// Whether `pid` names a process that is still running.
+///
+/// A zombie does not count. `/proc/<pid>` exists until the parent reaps the
+/// child, so an existence check alone reports an exited process as alive —
+/// which made a checkpoint wait out its full supervisor timeout whenever the
+/// supervisor's parent was still around to reap it, and would have let a
+/// restore refuse to start because a long-dead container was "already
+/// running".
+///
+/// The state character is the field after the last `)` in
+/// `/proc/<pid>/stat`; splitting there rather than on whitespace is what makes
+/// this safe for a process whose name contains spaces or parentheses.
 pub fn pid_alive(pid: i32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(after_comm) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !matches!(after_comm.1.split_whitespace().next(), Some("Z") | Some("X") | None)
 }
 
 /// Inode number behind each `/proc/<pid>/ns/*` link.
@@ -604,6 +622,43 @@ mod tests {
         assert_eq!(format_addr("0100007F:0050", false), "127.0.0.1:80");
         // 10.66.0.2:8080
         assert_eq!(format_addr("0200420A:1F90", false), "10.66.0.2:8080");
+    }
+
+    #[test]
+    fn pid_alive_sees_this_process_and_not_a_bogus_one() {
+        assert!(pid_alive(std::process::id() as i32));
+        // Pid 0 is never a real process.
+        assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn pid_alive_does_not_count_a_zombie() {
+        // Fork a child that exits immediately and is deliberately not reaped.
+        // /proc/<pid> still exists for it, so an existence check would call it
+        // alive; it is not.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+
+        // Give it a moment to become a zombie.
+        for _ in 0..200 {
+            if !pid_alive(child) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            Path::new(&format!("/proc/{child}")).exists(),
+            "test is not exercising the zombie case: the child was already reaped"
+        );
+        assert!(!pid_alive(child), "a zombie was reported as alive");
+
+        // Reap it so the test leaves nothing behind.
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
     }
 
     #[test]
