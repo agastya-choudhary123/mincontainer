@@ -25,6 +25,18 @@ pub enum RuntimeError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
+    #[error("checkpoint error: {0}")]
+    Checkpoint(String),
+
+    #[error("restore error: {0}")]
+    Restore(String),
+
+    #[error("migration error: {0}")]
+    Migration(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
