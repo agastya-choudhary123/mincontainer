@@ -67,8 +67,42 @@ impl ContainerConfig {
         }
     }
 
-    /// First 12 chars of the id, used for cgroup/veth naming.
+    /// Up to the first 12 bytes of the id, used for veth naming.
+    ///
+    /// Clamped rather than sliced at a fixed 12: a UUID is always long enough,
+    /// but `--id` takes an arbitrary string, and a shorter one used to panic
+    /// here — reachable only with `--net`, since that is the only caller.
+    /// `get` also keeps the slice on a character boundary for a non-ASCII id.
     pub fn short_id(&self) -> &str {
-        &self.id[..12]
+        let n = self.id.len().min(12);
+        self.id.get(..n).unwrap_or(&self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_id_handles_ids_shorter_than_twelve_bytes() {
+        let mut cfg = ContainerConfig::new("/rootfs".into(), vec!["/bin/sh".into()]);
+        // A UUID is longer than the cut-off.
+        assert_eq!(cfg.short_id().len(), 12);
+
+        // A user-supplied `--id` need not be. This used to panic, and only
+        // with --net, because veth naming is the sole caller.
+        cfg.id = "nettest".to_string();
+        assert_eq!(cfg.short_id(), "nettest");
+
+        cfg.id = "x".to_string();
+        assert_eq!(cfg.short_id(), "x");
+    }
+
+    #[test]
+    fn short_id_stays_on_a_character_boundary() {
+        let mut cfg = ContainerConfig::new("/rootfs".into(), vec!["/bin/sh".into()]);
+        // Four-byte characters: a naive [..12] would split one of these.
+        cfg.id = "\u{1F600}\u{1F600}\u{1F600}\u{1F600}".to_string();
+        let _ = cfg.short_id(); // must not panic
     }
 }
