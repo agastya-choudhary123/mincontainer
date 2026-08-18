@@ -71,6 +71,19 @@ impl Cgroup {
         Ok(Cgroup { path })
     }
 
+    /// Reference an existing leaf without creating it or touching delegation.
+    ///
+    /// Cleanup paths need a handle to a cgroup that may or may not exist, and
+    /// `create` would both re-run the delegation dance and resurrect a leaf we
+    /// are trying to remove.
+    pub fn open(id: &str) -> Self {
+        Cgroup { path: PathBuf::from(CGROUP_ROOT).join(id) }
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
     fn write(&self, file: &str, value: &str) -> Result<()> {
         let f = self.path.join(file);
         fs::write(&f, value)

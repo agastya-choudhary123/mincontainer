@@ -11,7 +11,7 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{chdir, execvpe, fork, pivot_root, sethostname, ForkResult, Pid};
 use serde::Serialize;
 use std::ffi::CString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Measurements captured for one container run.
@@ -28,6 +28,94 @@ pub struct Metrics {
     pub cpu_usec: u64,
     pub exit_code: i32,
     pub container_ip: Option<String>,
+}
+
+/// Where a detached container's stdio is redirected.
+///
+/// The directory is bind-mounted to [`IO_MOUNT`] *inside* the container's root
+/// before `pivot_root`, and the container opens its log files through that
+/// path. This is not cosmetic: a checkpoint engine records an open regular file
+/// by its path relative to the mount namespace root, so a log file living only
+/// on the host — outside the container's root — is not a dumpable fd. Binding
+/// it in gives fd 1 and 2 a path that exists in both the original and the
+/// restored mount namespace.
+#[derive(Debug, Clone)]
+pub struct Io {
+    /// Host directory holding `stdout` and `stderr`.
+    pub dir: PathBuf,
+}
+
+/// Mount point of [`Io::dir`] inside the container.
+pub const IO_MOUNT: &str = ".mcio";
+
+/// A container that has been started but not yet waited on.
+///
+/// Splitting spawn from wait is what makes checkpointing possible at all: the
+/// original `run()` owned the container for its whole lifetime, so there was
+/// never a moment where a caller held a live container and could do something
+/// else with it.
+pub struct Handle {
+    pub id: String,
+    /// Host-visible pid of the container's PID 1. This is the pid a checkpoint
+    /// engine dumps, and the reason the parent must stay in the host PID
+    /// namespace to learn it.
+    pub container_pid: Pid,
+    /// The middle process, which waits on the container and exits with its code.
+    pub supervisor_pid: Pid,
+    pub cgroup: Cgroup,
+    pub network: Option<Network>,
+    pub setup_ms: f64,
+    t0: Instant,
+}
+
+impl Handle {
+    pub fn container_ip(&self) -> Option<&str> {
+        self.network.as_ref().map(|n| n.container_ip())
+    }
+
+    /// Block until the container exits, then tear down and report metrics.
+    pub fn wait(self) -> Result<Metrics> {
+        let status = waitpid(self.supervisor_pid, None)
+            .map_err(|e| RuntimeError::Syscall("waitpid", e))?;
+        let wall_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
+
+        let exit_code = match status {
+            WaitStatus::Exited(_, code) => code,
+            WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+            _ => -1,
+        };
+
+        Ok(self.finish(exit_code, wall_ms))
+    }
+
+    /// Tear down cgroup and networking and produce metrics, without waiting.
+    /// Used when the container's processes are already gone — after a
+    /// checkpoint, the dump engine has killed the tree and there is nothing
+    /// left to reap.
+    pub fn finish(self, exit_code: i32, wall_ms: f64) -> Metrics {
+        let peak_mem_bytes = self.cgroup.peak_memory().unwrap_or(0);
+        let cpu_usec = self.cgroup.cpu_usage_usec().unwrap_or(0);
+        let container_ip = self.network.as_ref().map(|n| n.container_ip().to_string());
+
+        if let Some(n) = self.network {
+            n.cleanup();
+        }
+        self.cgroup.cleanup();
+
+        Metrics {
+            id: self.id,
+            setup_ms: self.setup_ms,
+            wall_ms,
+            peak_mem_bytes,
+            cpu_usec,
+            exit_code,
+            container_ip,
+        }
+    }
+
+    pub fn elapsed_ms(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64() * 1000.0
+    }
 }
 
 /// A raw pipe used to synchronise parent and child around fork.
@@ -89,6 +177,15 @@ fn close(fd: i32) {
 /// PID. Only the grandchild (created after `unshare(CLONE_NEWPID)`) actually
 /// enters the new PID namespace as PID 1.
 pub fn run(cfg: &ContainerConfig, index: u8) -> Result<Metrics> {
+    spawn(cfg, index, None)?.wait()
+}
+
+/// Start a container and return a [`Handle`] without waiting for it.
+///
+/// `io`, when given, redirects the container's stdio into files (see [`Io`]);
+/// with `None` the container inherits the caller's stdio, which is what the
+/// foreground `run` path wants.
+pub fn spawn(cfg: &ContainerConfig, index: u8, io: Option<&Io>) -> Result<Handle> {
     let t0 = Instant::now();
 
     let cgroup = Cgroup::create(&cfg.id)?;
@@ -102,7 +199,7 @@ pub fn run(cfg: &ContainerConfig, index: u8) -> Result<Metrics> {
             close(go.write);
             close(pidp.read);
             // Never returns; execs (grandchild) or _exit (middle).
-            middle(cfg, go.read, pidp.write)
+            middle(cfg, io, go.read, pidp.write)
         }
 
         ForkResult::Parent { child: middle_pid } => {
@@ -111,49 +208,31 @@ pub fn run(cfg: &ContainerConfig, index: u8) -> Result<Metrics> {
 
             // Learn the container's host PID from the middle process.
             let gc_pid = Pid::from_raw(read_pid(pidp.read));
+            close(pidp.read);
 
             // Only the container (grandchild) goes in the resource cgroup.
             cgroup.add_process(gc_pid)?;
 
-            let net = if cfg.network {
+            let network = if cfg.network {
                 Some(Network::setup(cfg.short_id(), gc_pid, index)?)
             } else {
                 None
             };
-            let container_ip = net.as_ref().map(|n| n.container_ip().to_string());
 
             let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             // Release the container to exec.
             notify(go.write);
+            close(go.write);
 
-            // The middle process exits with the container's exit code.
-            let status =
-                waitpid(middle_pid, None).map_err(|e| RuntimeError::Syscall("waitpid", e))?;
-            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-            let exit_code = match status {
-                WaitStatus::Exited(_, code) => code,
-                WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-                _ => -1,
-            };
-
-            let peak_mem_bytes = cgroup.peak_memory().unwrap_or(0);
-            let cpu_usec = cgroup.cpu_usage_usec().unwrap_or(0);
-
-            if let Some(n) = net {
-                n.cleanup();
-            }
-            cgroup.cleanup();
-
-            Ok(Metrics {
+            Ok(Handle {
                 id: cfg.id.clone(),
+                container_pid: gc_pid,
+                supervisor_pid: middle_pid,
+                cgroup,
+                network,
                 setup_ms,
-                wall_ms,
-                peak_mem_bytes,
-                cpu_usec,
-                exit_code,
-                container_ip,
+                t0,
             })
         }
     }
@@ -162,7 +241,7 @@ pub fn run(cfg: &ContainerConfig, index: u8) -> Result<Metrics> {
 /// The middle process: creates the namespaces and forks the real container.
 /// Stays in the host PID namespace itself (only its children enter the new PID
 /// namespace). Never returns.
-fn middle(cfg: &ContainerConfig, go_r: i32, pidp_w: i32) -> ! {
+fn middle(cfg: &ContainerConfig, io: Option<&Io>, go_r: i32, pidp_w: i32) -> ! {
     // NEWNS/UTS/IPC/NET take effect on this process immediately; NEWPID takes
     // effect on the next fork, making the grandchild PID 1.
     if let Err(e) = unshare(
@@ -179,7 +258,7 @@ fn middle(cfg: &ContainerConfig, go_r: i32, pidp_w: i32) -> ! {
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             close(pidp_w);
-            if let Err(e) = grandchild(cfg, go_r) {
+            if let Err(e) = grandchild(cfg, io, go_r) {
                 eprintln!("mincontainer: container setup failed: {e}");
                 unsafe { libc::_exit(127) };
             }
@@ -205,9 +284,35 @@ fn middle(cfg: &ContainerConfig, go_r: i32, pidp_w: i32) -> ! {
 
 /// The container process (PID 1 in its namespace). Sets up its root filesystem,
 /// applies hardening, and execs the command. Returns only on error.
-fn grandchild(cfg: &ContainerConfig, go_r: i32) -> Result<()> {
-    // Wait until the parent has attached us to the cgroup and wired networking.
+fn grandchild(cfg: &ContainerConfig, io: Option<&Io>, go_r: i32) -> Result<()> {
+    // Wait until the parent has attached us to the cgroup and wired networking,
+    // then close the pipe. Leaving it open would hand the container an fd it
+    // never asked for — visible in `inspect` as a stray `pipe:[...]`, and one
+    // more thing a checkpoint has to serialise and a restore reproduce.
     wait_for(go_r);
+    close(go_r);
+
+    // A detached container must lead its own session.
+    //
+    // We are PID 1 of a new PID namespace, but `setsid` was never called, so
+    // our session id is still the launching shell's — a session leader that
+    // lives in the *host* PID namespace and is therefore not part of the
+    // process tree a checkpoint would dump. CRIU refuses that outright:
+    //
+    //     Error (criu/cr-dump.c:1618): A session leader of 11(1) is outside
+    //     of its pid namespace
+    //
+    // Calling `setsid` makes this process its own session and process-group
+    // leader, so the whole session is contained within the namespace and the
+    // tree is self-contained.
+    //
+    // This is done only for detached containers. `setsid` also drops the
+    // controlling terminal, and a foreground `mincontainer run -- /bin/sh`
+    // needs to keep it or the shell is unusable and Ctrl-C stops working. That
+    // is the tradeoff behind requiring `start --detach` before `checkpoint`.
+    if io.is_some() {
+        nix::unistd::setsid().map_err(|e| RuntimeError::Syscall("setsid", e))?;
+    }
 
     sethostname(&cfg.hostname).map_err(|e| RuntimeError::Syscall("sethostname", e))?;
 
@@ -218,9 +323,21 @@ fn grandchild(cfg: &ContainerConfig, go_r: i32) -> Result<()> {
         mount_volume_into_rootfs(rootfs_path, &vol.host_path, &vol.container_path)?;
     }
 
+    // Bind the io directory in *before* pivot_root, for the same reason as
+    // volumes: after the pivot its host path is gone.
+    if let Some(io) = io {
+        mount_volume_into_rootfs(rootfs_path, &io.dir.to_string_lossy(), IO_MOUNT)?;
+    }
+
     setup_rootfs(rootfs_path)?;
 
     chdir("/").map_err(|e| RuntimeError::Syscall("chdir(/)", e))?;
+
+    // Redirect stdio only now: the target paths exist solely inside the new
+    // root, and /dev had to be mounted first for /dev/null to resolve.
+    if io.is_some() {
+        redirect_stdio()?;
+    }
 
     // Hardening — order matters: drop caps and install seccomp last, after all
     // privileged mount work is done (mount/pivot_root are on the seccomp
@@ -248,6 +365,40 @@ fn grandchild(cfg: &ContainerConfig, go_r: i32) -> Result<()> {
 
     execvpe(&prog, &argv, &envp).map_err(|e| RuntimeError::Syscall("execvpe", e))?;
     unreachable!("execvpe returned without error");
+}
+
+/// Point fd 0 at /dev/null and fds 1 and 2 at the bound-in log files.
+///
+/// Uses raw `open`/`dup2` rather than `std::fs::File` so the descriptors are
+/// exactly 0, 1 and 2 with no stray extras left open — every additional open fd
+/// is one more thing the checkpoint engine has to describe and the restore has
+/// to reproduce.
+fn redirect_stdio() -> Result<()> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{close as nix_close, dup2};
+
+    let devnull = open("/dev/null", OFlag::O_RDWR, Mode::empty())
+        .map_err(|e| RuntimeError::Syscall("open(/dev/null)", e))?;
+    dup2(devnull, 0).map_err(|e| RuntimeError::Syscall("dup2(stdin)", e))?;
+    if devnull > 2 {
+        let _ = nix_close(devnull);
+    }
+
+    for (fd, name) in [(1, "stdout"), (2, "stderr")] {
+        let path = format!("/{IO_MOUNT}/{name}");
+        let f = open(
+            path.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND,
+            Mode::from_bits_truncate(0o644),
+        )
+        .map_err(|e| RuntimeError::Syscall("open(container log)", e))?;
+        dup2(f, fd).map_err(|e| RuntimeError::Syscall("dup2(container log)", e))?;
+        if f > 2 {
+            let _ = nix_close(f);
+        }
+    }
+    Ok(())
 }
 
 /// pivot_root into `rootfs` and mount a fresh /proc and /dev.

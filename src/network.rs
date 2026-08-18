@@ -63,8 +63,7 @@ impl Network {
     pub fn setup(short_id: &str, pid: Pid, index: u8) -> Result<Self> {
         ensure_bridge()?;
 
-        let host_veth = format!("mch{short_id}");
-        let host_veth = host_veth[..host_veth.len().min(15)].to_string(); // IFNAMSIZ
+        let host_veth = Self::host_veth_name(short_id);
         let peer = format!("mcp{short_id}");
         let peer = peer[..peer.len().min(15)].to_string();
         let container_ip = format!("10.66.0.{}", 1 + index as u16 + 1); // .2, .3, ...
@@ -93,5 +92,21 @@ impl Network {
     /// Tear down the host-side veth (the peer disappears with the netns).
     pub fn cleanup(&self) {
         let _ = run("ip", &["link", "delete", &self.host_veth]);
+    }
+
+    /// The host-side veth name a given container would have used.
+    fn host_veth_name(short_id: &str) -> String {
+        let n = format!("mch{short_id}");
+        n[..n.len().min(15)].to_string() // IFNAMSIZ
+    }
+
+    /// Delete a container's veth without holding a `Network`.
+    ///
+    /// Recovery path: if a restore is killed after the veth is created but
+    /// before the handle is stored, the interface outlives the container and
+    /// the name collides on the next attempt. Deriving the name from the id
+    /// means cleanup never needs state that the crash may have destroyed.
+    pub fn cleanup_by_id(short_id: &str) {
+        let _ = run("ip", &["link", "delete", &Self::host_veth_name(short_id)]);
     }
 }
