@@ -1,12 +1,17 @@
 pub mod capabilities;
 pub mod cgroups;
+pub mod checkpoint;
 pub mod config;
 pub mod container;
+pub mod criu;
 pub mod error;
+pub mod migrate;
 pub mod network;
+pub mod restore;
 pub mod seccomp;
 pub mod snapshot;
 pub mod state;
+pub mod transport;
 
 pub use config::{ContainerConfig, Resources, Volume};
 pub use container::{run, Metrics};

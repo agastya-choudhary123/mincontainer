@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 \
         iptables \
         runc \
+        criu \
+        procps \
+        iputils-ping \
         curl \
         ca-certificates \
         jq \
