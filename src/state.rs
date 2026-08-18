@@ -6,8 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-const STATE_DIR: &str = "/.mincontainer/containers";
-
 /// Lifecycle status of a container.
 ///
 /// Checkpointing adds three states to the original four. The transient ones

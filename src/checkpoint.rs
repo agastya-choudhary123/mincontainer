@@ -178,7 +178,15 @@ pub fn checkpoint(id: &str, opts: &Options) -> Result<Report> {
 
     // --- 6. commit ----------------------------------------------------------
     if opts.leave_running {
-        state::update(id, |s| s.snapshot = Some(dest.display().to_string()))?;
+        // The container never stopped, so it goes back to Running — not left
+        // in the transient Checkpointing state, which reconciliation would
+        // later mistake for an interrupted dump and clean up by killing the
+        // very processes we deliberately kept alive.
+        state::update(id, |s| {
+            s.status = Status::Running.as_str().to_string();
+            s.snapshot = Some(dest.display().to_string());
+            s.checkpointed_at = Some(now_iso());
+        })?;
     } else {
         state::set_checkpointed(id, &dest)?;
     }
@@ -347,8 +355,11 @@ fn format_addr(raw: &str, v6: bool) -> String {
 
     match u32::from_str_radix(addr, 16) {
         Ok(v) => {
+            // procfs prints the address as a host-order u32, so on a
+            // little-endian machine 127.0.0.1 appears as "0100007F". Taking the
+            // little-endian bytes recovers the octets already in network order.
             let b = v.to_le_bytes();
-            format!("{}.{}.{}.{}:{port}", b[3], b[2], b[1], b[0])
+            format!("{}.{}.{}.{}:{port}", b[0], b[1], b[2], b[3])
         }
         Err(_) => format!("{addr}:{port}"),
     }

@@ -173,9 +173,9 @@ pub fn restore(id: &str, opts: &Options) -> Result<Report> {
 
         cgroup.add_process(Pid::from_raw(pid))?;
 
-        // A restore that somehow landed back in the *original* namespaces would
-        // mean we are sharing state with a container that no longer exists.
-        assert_fresh_namespaces(pid, &manifest)?;
+        // The engine was asked for fresh namespaces; verify it delivered them
+        // rather than leaving the container sharing the host's.
+        assert_isolated_from_host(pid)?;
 
         let ip = if cfg.network {
             let net = Network::setup(cfg.short_id(), Pid::from_raw(pid), opts.index)?;
@@ -440,31 +440,37 @@ fn check_compatible(m: &Manifest) -> Result<()> {
     Ok(())
 }
 
-/// Namespaces must be new. Matching inode numbers would mean the restored
-/// processes rejoined the namespaces of the container we checkpointed, which on
-/// a same-host restore is a real possibility if the original never died.
-fn assert_fresh_namespaces(pid: i32, m: &Manifest) -> Result<()> {
-    let read = |kind: &str| -> Option<u64> {
-        let link = std::fs::read_link(format!("/proc/{pid}/ns/{kind}")).ok()?;
+/// The restored process must be in namespaces of its own, not the host's.
+///
+/// This started life as a comparison against the namespace inodes recorded in
+/// the manifest, on the theory that matching inodes would mean we had somehow
+/// rejoined the checkpointed container's namespaces. That invariant is false:
+/// the kernel recycles namespace inode numbers once a namespace is destroyed,
+/// so a perfectly fresh namespace routinely lands on a dead one's inode. The
+/// check fired on a legitimate retry after an interrupted restore and refused
+/// to bring the container back — a false alarm on exactly the recovery path it
+/// was supposed to protect.
+///
+/// What *is* checkable is isolation from this process, which lives in the host
+/// namespaces: if the restored container shares any of them, the engine did not
+/// build the namespaces it was asked to and the container is not contained.
+fn assert_isolated_from_host(pid: i32) -> Result<()> {
+    let read = |target: &str, kind: &str| -> Option<u64> {
+        let link = std::fs::read_link(format!("/proc/{target}/ns/{kind}")).ok()?;
         let s = link.to_string_lossy();
         let inner = s.split_once('[')?.1.strip_suffix(']')?;
         inner.parse().ok()
     };
 
-    for (kind, old) in [
-        ("pid", m.namespaces.pid),
-        ("mnt", m.namespaces.mnt),
-        ("uts", m.namespaces.uts),
-        ("ipc", m.namespaces.ipc),
-    ] {
-        let (Some(old), Some(new)) = (old, read(kind)) else {
+    for kind in ["pid", "mnt", "uts", "ipc", "net"] {
+        let (Some(host), Some(restored)) = (read("self", kind), read(&pid.to_string(), kind))
+        else {
             continue;
         };
-        if old == new {
+        if host == restored {
             return Err(RuntimeError::Restore(format!(
-                "restored process is in the *original* {kind} namespace (inode {old}) — \
-                 the checkpointed container is apparently still alive, and continuing would \
-                 give two containers one namespace"
+                "restored process {pid} shares the host's {kind} namespace (inode {host}) — \
+                 the container was not isolated and must not be left running"
             )));
         }
     }
