@@ -143,6 +143,22 @@ pub fn checkpoint(id: &str, opts: &Options) -> Result<Report> {
     }
     let dump_ms = t_dump.elapsed().as_secs_f64() * 1000.0;
 
+    // The dump killed the container's processes, so the detached supervisor is
+    // now waking up to tear down its cgroup and veth. Let it finish.
+    //
+    // Skipping this is a race with a long fuse: the supervisor's `remove_dir`
+    // on the cgroup lands *after* a subsequent restore has recreated it, and
+    // the restore then fails moving the restored process into a cgroup that
+    // just vanished ("write .../cgroup.procs: No such file or directory"). It
+    // showed up only with --net, because deleting a veth makes the supervisor
+    // slow enough to lose the race reliably.
+    if !opts.leave_running {
+        await_supervisor_exit(&st, std::time::Duration::from_secs(5));
+        // Whether or not the supervisor got there, the cgroup must be gone
+        // before we report success, so the next restore starts from clean.
+        crate::cgroups::Cgroup::open(&cfg.id).cleanup();
+    }
+
     // --- 5. pack ------------------------------------------------------------
     let t_pack = Instant::now();
     let dest = opts
@@ -202,6 +218,29 @@ pub fn checkpoint(id: &str, opts: &Options) -> Result<Report> {
         pack_ms,
         total_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Wait for a container's detached supervisor to exit.
+///
+/// Best effort: a supervisor that outlives the timeout is reported rather than
+/// waited on forever, since the caller can still make progress and the cgroup
+/// is removed explicitly either way.
+fn await_supervisor_exit(st: &ContainerState, timeout: std::time::Duration) {
+    let Some(sup) = st.supervisor_pid else {
+        return;
+    };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_alive(sup) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    eprintln!(
+        "[mincontainer] warning: supervisor {sup} still running {}s after the dump; \
+         its cleanup may race a later restore",
+        timeout.as_secs()
+    );
 }
 
 /// Metadata gathered before the dump, handed to the packer.

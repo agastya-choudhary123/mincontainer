@@ -451,7 +451,12 @@ fn supervise(id: &str, cfg: &ContainerConfig, dir: &ContainerStateDir) -> ! {
     };
 
     let container_pid = handle.container_pid;
-    if let Err(e) = state::set_running(id, container_pid) {
+    // Record ourselves alongside the container: a checkpoint has to wait for
+    // this process to finish tearing down before it can report success, or its
+    // cleanup races the next restore's setup.
+    if let Err(e) =
+        state::set_running_under(id, container_pid, Some(nix::unistd::getpid()))
+    {
         eprintln!("[mincontainer] record running state: {e}");
     }
 

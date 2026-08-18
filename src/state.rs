@@ -77,6 +77,13 @@ pub struct ContainerState {
     /// Host this container last ran on, set when it arrives via migration.
     #[serde(default)]
     pub origin_host: Option<String>,
+    /// Pid of the detached supervisor owning this container, if any.
+    ///
+    /// Recorded so a checkpoint can wait for the supervisor to finish tearing
+    /// down before it returns. Without that, the supervisor's cleanup races
+    /// the next restore's setup.
+    #[serde(default)]
+    pub supervisor_pid: Option<i32>,
 }
 
 impl ContainerState {
@@ -94,6 +101,7 @@ impl ContainerState {
             restored_at: None,
             generation: 0,
             origin_host: None,
+            supervisor_pid: None,
         }
     }
 
@@ -226,11 +234,17 @@ pub fn get_container(id: &str) -> Result<ContainerState> {
 }
 
 pub fn set_running(id: &str, pid: Pid) -> Result<()> {
+    set_running_under(id, pid, None)
+}
+
+/// Mark a container running, optionally recording the supervisor that owns it.
+pub fn set_running_under(id: &str, pid: Pid, supervisor: Option<Pid>) -> Result<()> {
     let dir = ContainerStateDir::for_id(id);
     let mut state = dir.load_state()?;
     state.status = Status::Running.as_str().to_string();
     state.pid = Some(pid.as_raw());
     state.started_at = Some(now_iso());
+    state.supervisor_pid = supervisor.map(|p| p.as_raw());
     dir.save_state(&state)?;
     Ok(())
 }
@@ -257,6 +271,7 @@ pub fn set_checkpointed(id: &str, snapshot: &std::path::Path) -> Result<()> {
     update(id, |s| {
         s.status = Status::Checkpointed.as_str().to_string();
         s.pid = None;
+        s.supervisor_pid = None;
         s.snapshot = Some(snapshot.display().to_string());
         s.checkpointed_at = Some(now_iso());
     })
@@ -268,6 +283,7 @@ pub fn set_restored(id: &str, pid: Pid) -> Result<()> {
         s.status = Status::Running.as_str().to_string();
         s.pid = Some(pid.as_raw());
         s.restored_at = Some(now_iso());
+        s.supervisor_pid = None;
         s.generation += 1;
         s.exit_code = None;
         s.stopped_at = None;
