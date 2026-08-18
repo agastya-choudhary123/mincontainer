@@ -96,14 +96,14 @@ pub fn migrate(id: &str, target: &str, opts: &Options) -> Result<MigrationReport
     // A failure here leaves the container checkpointed locally, which is a
     // recoverable state: the operator restores it here, or retries the
     // migration with --use-existing. Nothing is lost.
-    let (result, transfer_ms, bytes) =
-        transport::send_snapshot(id, &snapshot, target, &opts.token).map_err(|e| {
+    let tx = transport::send_snapshot(id, &snapshot, target, &opts.token).map_err(|e| {
             RuntimeError::Migration(format!(
                 "{e}\n\nThe container is checkpointed on this node and was NOT handed over. \
                  Recover with:\n    mincontainer restore {id}\nor retry with:\n    \
                  mincontainer migrate {id} {target} --use-existing"
-            ))
-        })?;
+        ))
+    })?;
+    let transport::Transfer { result, hash_ms, transfer_ms, bytes } = tx;
 
     // --- release -------------------------------------------------------------
     // Only now, with the far side confirming a running process, does this node
@@ -127,8 +127,10 @@ pub fn migrate(id: &str, target: &str, opts: &Options) -> Result<MigrationReport
         target: target.to_string(),
         snapshot_bytes: bytes,
         checkpoint_ms,
+        hash_ms,
         transfer_ms,
-        remote_restore_ms: result.restore_ms,
+        remote_restore_ms: result.restore_total_ms,
+        remote_build_ms: result.restore_build_ms,
         total_ms,
         throughput_mib_s,
         remote_pid: result.pid,

@@ -267,7 +267,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Commands::Create(a) => cmd_create(a),
-        Commands::Start { id, detach } => cmd_start(&id, detach),
+        Commands::Start { id, detach } => cmd_start(&id, detach, false),
         Commands::Stop { id } => cmd_stop(&id),
         Commands::Ps => cmd_ps(),
         Commands::Logs { id } => cmd_logs(&id),
@@ -336,7 +336,9 @@ fn cmd_create(a: CreateArgs) -> i32 {
     0
 }
 
-fn cmd_start(id: &str, detach: bool) -> i32 {
+/// `quiet` suppresses the id on stdout, so callers that emit machine-readable
+/// output (bench-cr's --json) are not interleaved with it.
+fn cmd_start(id: &str, detach: bool, quiet: bool) -> i32 {
     if let Err(e) = state::ContainerStateDir::init() {
         eprintln!("[mincontainer] init state: {e}");
         return 1;
@@ -399,8 +401,12 @@ fn cmd_start(id: &str, detach: bool) -> i32 {
             // means the container is genuinely up and checkpointable.
             match await_running(id, std::time::Duration::from_secs(10)) {
                 Some(pid) => {
-                    println!("{id}");
-                    eprintln!("[mincontainer] {id} running detached (pid {pid})");
+                    if !quiet {
+                        println!("{id}");
+                    }
+                    if !quiet {
+                        eprintln!("[mincontainer] {id} running detached (pid {pid})");
+                    }
                     0
                 }
                 None => {
@@ -788,18 +794,23 @@ fn cmd_migrate(a: MigrateArgs) -> i32 {
                 println!("{}", serde_json::to_string_pretty(&r).unwrap());
             } else {
                 eprintln!(
-                    "[mincontainer] migrated {} to {} — {:.2} MiB, checkpoint {:.1}ms, \
-                     transfer {:.1}ms ({:.1} MiB/s), remote restore {:.1}ms, total {:.1}ms; \
-                     now pid {} there",
+                    "[mincontainer] migrated {} to {} — {:.2} MiB\n  \
+                     checkpoint {:.1}ms, hash {:.1}ms, transfer {:.1}ms ({:.0} MiB/s), \
+                     remote restore {:.1}ms (build {:.1}ms), total {:.1}ms\n  \
+                     now pid {} on {}{}",
                     r.id,
                     r.target,
                     r.snapshot_bytes as f64 / (1024.0 * 1024.0),
                     r.checkpoint_ms,
+                    r.hash_ms,
                     r.transfer_ms,
                     r.throughput_mib_s,
                     r.remote_restore_ms,
+                    r.remote_build_ms,
                     r.total_ms,
                     r.remote_pid,
+                    r.target,
+                    r.remote_ip.as_deref().map(|ip| format!(" (ip {ip})")).unwrap_or_default(),
                 );
             }
             0
@@ -943,17 +954,29 @@ fn cmd_bench_cr(a: BenchCrArgs) -> i32 {
         return 1;
     }
 
-    // Fill `touch_mb` MiB with a shell string, one MiB at a time, then idle.
-    // Deliberately built from shell builtins so the rootfs needs nothing but
-    // /bin/sh, and so the pages are anonymous private memory — the case a
-    // checkpoint actually has to serialise.
-    let script = format!(
-        "chunk=$(awk 'BEGIN{{while(i++<1024) printf \"x\"}}'); \
-         i=0; while [ $i -lt {} ]; do j=0; part=; while [ $j -lt 1024 ]; do \
-         part=\"$part$chunk\"; j=$((j+1)); done; eval \"blk$i=\\$part\"; i=$((i+1)); done; \
-         echo filled; while true; do sleep 1; done",
-        a.touch_mb
-    );
+    // Allocate `touch_mb` MiB of anonymous memory and write to all of it,
+    // then idle.
+    //
+    // The string is grown by *doubling* rather than by appending fixed chunks.
+    // Appending is quadratic — the shell copies the whole accumulated string on
+    // every concatenation — and at 128 MiB that workload takes longer to
+    // allocate than the entire benchmark should take to run. Doubling reaches
+    // the target in log2(n) copies.
+    //
+    // Built from shell builtins so the rootfs needs nothing but /bin/sh, and so
+    // the pages are anonymous private memory: the case a checkpoint actually
+    // has to serialise, as opposed to a file mapping it can reference by path.
+    let script = if a.touch_mb == 0 {
+        "echo filled; while true; do sleep 1; done".to_string()
+    } else {
+        format!(
+            "target=$(({} * 1024 * 1024)); \
+             s=$(awk 'BEGIN{{while(i++<1024) printf \"x\"}}'); \
+             while [ ${{#s}} -lt $target ]; do s=\"$s$s\"; done; \
+             echo filled; while true; do sleep 1; done",
+            a.touch_mb
+        )
+    };
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
 
     let mut ckpt_ms = Vec::new();
@@ -984,7 +1007,7 @@ fn cmd_bench_cr(a: BenchCrArgs) -> i32 {
             return 1;
         }
 
-        if cmd_start(&id, true) != 0 {
+        if cmd_start(&id, true, a.json) != 0 {
             eprintln!("[bench-cr] run {i}: container did not start");
             return 1;
         }

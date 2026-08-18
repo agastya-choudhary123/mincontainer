@@ -183,7 +183,15 @@ pub struct MigrateResult {
     pub container_id: String,
     pub pid: i32,
     pub generation: u32,
-    pub restore_ms: f64,
+    /// Everything the receiver spent between the last byte arriving and the
+    /// container running: checksum verification, unpacking, and the rebuild.
+    ///
+    /// Reporting only the rebuild here left roughly half the wall-clock time of
+    /// a migration unattributed, which made the numbers useless for working out
+    /// where the cost actually is.
+    pub restore_total_ms: f64,
+    /// The rebuild alone, for comparison against a local restore.
+    pub restore_build_ms: f64,
     pub container_ip: Option<String>,
     pub message: String,
 }
@@ -204,10 +212,14 @@ pub struct MigrationReport {
     pub target: String,
     pub snapshot_bytes: u64,
     pub checkpoint_ms: f64,
+    /// Checksumming the snapshot locally before handing it over.
+    pub hash_ms: f64,
     /// Time on the wire.
     pub transfer_ms: f64,
-    /// Restore time as reported by the receiver.
+    /// Verify + unpack + rebuild, as reported by the receiver.
     pub remote_restore_ms: f64,
+    /// The receiver's rebuild step alone.
+    pub remote_build_ms: f64,
     pub total_ms: f64,
     pub throughput_mib_s: f64,
     pub remote_pid: i32,
@@ -220,12 +232,19 @@ pub struct MigrationReport {
 /// is responsible for freezing it first. Splitting those apart keeps this
 /// function honest about what it does: it moves bytes and reports what the far
 /// side said, and it never decides on its own to stop a running container.
+pub struct Transfer {
+    pub result: MigrateResult,
+    pub hash_ms: f64,
+    pub transfer_ms: f64,
+    pub bytes: u64,
+}
+
 pub fn send_snapshot(
     id: &str,
     snapshot: &Path,
     target: &str,
     token: &str,
-) -> Result<(MigrateResult, f64, u64)> {
+) -> Result<Transfer> {
     let addr = resolve(target)?;
 
     let file_len = std::fs::metadata(snapshot)
@@ -234,8 +253,11 @@ pub fn send_snapshot(
 
     // Checksum before connecting: it costs one read of a local file and means
     // a corrupt snapshot is caught here rather than after the peer has taken
-    // custody of it.
+    // custody of it. Timed separately so it is not silently charged to the
+    // network.
+    let t_hash = Instant::now();
     let crc = crc_of_file(snapshot)?;
+    let hash_ms = t_hash.elapsed().as_secs_f64() * 1000.0;
 
     let t0 = Instant::now();
     let stream = TcpStream::connect(addr).map_err(|e| {
@@ -314,7 +336,7 @@ pub fn send_snapshot(
         )));
     }
 
-    Ok((result, transfer_ms, file_len))
+    Ok(Transfer { result, hash_ms, transfer_ms, bytes: file_len })
 }
 
 fn resolve(target: &str) -> Result<std::net::SocketAddr> {
@@ -551,7 +573,8 @@ fn handle_one(stream: TcpStream, token: &str, index: u8) -> Result<String> {
                     container_id: rep.id.clone(),
                     pid: rep.pid,
                     generation: rep.generation,
-                    restore_ms: rep.restore_ms,
+                    restore_total_ms: rep.total_ms,
+                    restore_build_ms: rep.restore_ms,
                     container_ip: rep.container_ip.clone(),
                     message: format!("restored on {}", checkpoint::hostname()),
                 },
@@ -570,7 +593,8 @@ fn handle_one(stream: TcpStream, token: &str, index: u8) -> Result<String> {
                     container_id: hello.container_id.clone(),
                     pid: 0,
                     generation: 0,
-                    restore_ms: 0.0,
+                    restore_total_ms: 0.0,
+                    restore_build_ms: 0.0,
                     container_ip: None,
                     message: e.to_string(),
                 },
