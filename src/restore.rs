@@ -131,11 +131,18 @@ pub fn restore(id: &str, opts: &Options) -> Result<Report> {
     // output is continuous rather than restarting empty on the new node.
     restore_io_files(&mut reader, &staging, &dir)?;
 
+    // Every external mount needs its target to exist inside the rootfs before
+    // the engine tries to bind onto it. On the original host `container.rs`
+    // created these on the way in; on a migration target the rootfs is
+    // pristine and has never heard of /.mcio, so the restore fails with
+    // "Can't stat mountpoint ... /.mcio: No such file or directory".
+    prepare_mount_points(&cfg, &layout_for_cfg(&cfg, &dir))?;
+
     let cgroup = Cgroup::create(&cfg.id)?;
     cgroup.apply(&cfg.resources)?;
     rb.cgroup = Some(cfg.id.clone());
 
-    let layout = checkpoint::layout_for(&cfg, &dir);
+    let layout = layout_for_cfg(&cfg, &dir);
     let pidfile = staging.join("restored.pid");
     let restore_opts = criu::RestoreOptions {
         images_dir: images_dir.clone(),
@@ -459,6 +466,49 @@ fn assert_fresh_namespaces(pid: i32, m: &Manifest) -> Result<()> {
                  the checkpointed container is apparently still alive, and continuing would \
                  give two containers one namespace"
             )));
+        }
+    }
+    Ok(())
+}
+
+fn layout_for_cfg(cfg: &ContainerConfig, dir: &ContainerStateDir) -> criu::Layout {
+    checkpoint::layout_for(cfg, dir)
+}
+
+/// Create each external mount's target inside the rootfs.
+///
+/// Directories only, and only ones the container already had: this mirrors
+/// exactly what `container::spawn` does on a normal start, so a restored
+/// container sees the same mount tree it was checkpointed with.
+fn prepare_mount_points(cfg: &ContainerConfig, layout: &criu::Layout) -> Result<()> {
+    let rootfs = Path::new(&cfg.rootfs);
+    for m in &layout.external_mounts {
+        let target = rootfs.join(m.container_path.trim_start_matches('/'));
+        std::fs::create_dir_all(&target).map_err(|e| {
+            RuntimeError::Restore(format!(
+                "create mount point {}: {e}",
+                target.display()
+            ))
+        })?;
+
+        // The source has to exist too, or the bind has nothing to attach.
+        // A volume that was present on the source host but not here is a real
+        // configuration error and must be loud, not silently created empty:
+        // the container would come back with its data missing.
+        if !Path::new(&m.host_path).exists() {
+            if m.key == "mcio" {
+                // The io directory is runtime-owned; creating it is correct.
+                std::fs::create_dir_all(&m.host_path).map_err(|e| {
+                    RuntimeError::Restore(format!("create io dir {}: {e}", m.host_path))
+                })?;
+            } else {
+                return Err(RuntimeError::Restore(format!(
+                    "volume source {} does not exist on this host, but the container has \
+                     {} bind-mounted from it — stage the volume before restoring, or the \
+                     container comes back with its data missing",
+                    m.host_path, m.container_path
+                )));
+            }
         }
     }
     Ok(())
